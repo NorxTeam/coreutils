@@ -19,13 +19,15 @@ def run(*args: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
-    parser.parse_args()
-    upstream = run("rev-parse", "upstream/master")
+    parser.add_argument("--branch", help="optional upstream branch; defaults to master")
+    args = parser.parse_args()
+    branch = args.branch or "master"
+    upstream = run("rev-parse", f"upstream/{branch}")
     origin = run("remote", "get-url", "origin")
     if "NorxTeam/coreutils" not in origin:
         raise SystemExit(f"origin is not the maintained Norx fork: {origin}")
     status = run("status", "--porcelain", "--", "UPSTREAM.md", "patches/series", "norx")
-    print(f"upstream/master={upstream}")
+    print(f"upstream/{branch}={upstream}")
     print(f"origin={origin}")
     print(f"Norx port changes={'dirty' if status else 'clean'}")
     return 0

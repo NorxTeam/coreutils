@@ -8,12 +8,14 @@ version = "0.1.0"
 license = "GPL-3.0-or-later"
 
 [source]
-kind = "git-fork"
-fork_url = "https://github.com/NorxTeam/coreutils.git"
-upstream_url = "https://github.com/coreutils/coreutils.git"
+kind = "git"
+url = "https://github.com/coreutils/coreutils.git"
 baseline_commit = "f5e1fd312683e039985c733037f81e6c1378ac2a"
 patch_series = "patches/series"
 provenance = "UPSTREAM.md"
+
+[provenance]
+maintained_fork = "https://github.com/NorxTeam/coreutils.git"
 
 [build]
 script = "norx/scripts/build.py"
