@@ -1,0 +1,31 @@
+schema = "gamma-recipe"
+schema_version = 2
+status = "active-port"
+
+[package]
+name = "coreutils"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+
+[source]
+kind = "git-fork"
+fork_url = "https://github.com/NorxTeam/coreutils.git"
+upstream_url = "https://github.com/coreutils/coreutils.git"
+baseline_commit = "f5e1fd312683e039985c733037f81e6c1378ac2a"
+patch_series = "patches/series"
+provenance = "UPSTREAM.md"
+
+[build]
+script = "norx/scripts/build.py"
+network = false
+targets = ["x86_64", "aarch64"]
+build_std = ["core", "alloc"]
+
+[dependencies]
+toolchain = "../toolchain"
+runtime = "../userspace/runtime"
+kernel_abi = "../userspace/include/norx/syscall.h"
+
+[outputs]
+image = "test-rootfs/tests/coreutils/<triple>/coreutils.elf"
+manifest = "test-rootfs/var/lib/coreutils/manifest.toml"

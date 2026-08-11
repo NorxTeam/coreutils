@@ -1,0 +1,3 @@
+# The Norx port is currently carried as the maintained fork's `norx/coreutils`
+# branch. Keep this ordered list in sync when the port is split into reviewable
+# patches; upstream source files remain unmodified until a patch is listed.
