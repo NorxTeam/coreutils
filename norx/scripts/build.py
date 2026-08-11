@@ -118,7 +118,7 @@ def main() -> int:
         f'fork_commit = "{git_output("rev-parse", "HEAD")}"',
         f'upstream_document_sha256 = "{sha256(COREUTILS_ROOT / "UPSTREAM.md")}"',
         f'patch_series_sha256 = "{sha256(COREUTILS_ROOT / "patches" / "series")}"',
-        f'dirty = {bool(git_output("status", "--porcelain"))}',
+        f'dirty = {str(bool(git_output("status", "--porcelain"))).lower()}',
         f'rustc_version = "{versions["rustc_version"]}"',
         f'rustc_commit = "{versions["rustc_commit"]}"',
         'panic_policy = "abort"',
