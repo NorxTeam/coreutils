@@ -21,7 +21,7 @@ invocation or unsupported option returns 2; an unknown command returns 127.
 | `touch` | `touch PATH...`; creates files if missing; timestamps are intentionally not implemented. |
 | `ln` | `ln SOURCE DEST`; creates a hard link; `ln -s` is rejected because the VFS has no symlink ABI. |
 | `stat` | `stat PATH...`; prints path, size, type, mode, link count, and inode. |
-| `find` | `find [--] [PATH] [-name GLOB] [-type f\|d]`; recursive depth is bounded at 32; glob supports `*` and `?`. |
+| `find` | `find [--] [PATH] [-name GLOB] [-type f\|d]`; recursive depth is bounded at 32, visited nodes at 1024, output at 32 KiB, and traversal work at 64 KiB; repeated directory inode identities are rejected as cycles; glob supports `*` and `?`. |
 | `grep` | `grep [-n] [-v] [--] PATTERN [FILE...]`; literal byte matching, one output line per matching input line; empty patterns are rejected. |
 | `head` | `head [-n N\|-nN] [--] [FILE...]`; prints the first N lines, default 10. |
 | `tail` | `tail [-n N\|-nN] [--] [FILE...]`; prints the last N lines, default 10. |

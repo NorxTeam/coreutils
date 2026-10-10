@@ -8,7 +8,7 @@ use core::alloc::Layout;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-use norx_coreutils::{run, startup_from_stack, syscall};
+use norx_coreutils::{run, startup_from_stack, syscall, STARTUP_REJECT_STATUS};
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
@@ -46,9 +46,18 @@ global_asm!(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn norx_start(stack: *const usize) -> ! {
-    let startup = unsafe { startup_from_stack(stack) };
-    let args = unsafe { norx_coreutils::collect_args(startup) };
-    let environment = unsafe { norx_coreutils::collect_environment(startup) };
+    let startup = match unsafe { startup_from_stack(stack) } {
+        Ok(startup) => startup,
+        Err(_) => syscall::exit(STARTUP_REJECT_STATUS),
+    };
+    let args = match norx_coreutils::collect_args(startup) {
+        Ok(args) => args,
+        Err(error) => syscall::exit(error.errno() as i32),
+    };
+    let environment = match norx_coreutils::collect_environment(startup) {
+        Ok(environment) => environment,
+        Err(error) => syscall::exit(error.errno() as i32),
+    };
     let mut command = args.first().copied().unwrap_or(b"coreutils");
     if let Some(name) = command.rsplit(|byte| *byte == b'/').next() {
         command = name;

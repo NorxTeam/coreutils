@@ -1,6 +1,8 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
@@ -34,6 +36,7 @@ pub mod syscall {
         Link = 424,
         Stat = 425,
         ReadDir = 426,
+        Fstat = 430,
     }
 
     pub const OPEN_READ: Word = 1 << 0;
@@ -41,6 +44,7 @@ pub mod syscall {
     pub const OPEN_CREATE: Word = 1 << 2;
     pub const OPEN_TRUNCATE: Word = 1 << 3;
     pub const OPEN_APPEND: Word = 1 << 4;
+    pub const OPEN_EXCLUSIVE: Word = 1 << 5;
     pub const STAT_REGULAR: u32 = 1;
     pub const STAT_DIRECTORY: u32 = 2;
     pub const NAME_MAX: usize = 31;
@@ -254,6 +258,16 @@ pub mod syscall {
         .map(|_| ())
     }
 
+    pub fn fstat(fd: Word, output: &mut Stat) -> Result<(), Error> {
+        result(unsafe {
+            raw6(
+                Number::Fstat as Word,
+                [fd, output as *mut Stat as Word, 0, 0, 0, 0],
+            )
+        })
+        .map(|_| ())
+    }
+
     pub fn read_dir(path: &[u8], output: &mut [DirEntry]) -> Result<usize, Error> {
         result(unsafe {
             raw6(
@@ -280,106 +294,402 @@ pub mod syscall {
 }
 
 const HEAP_BYTES: usize = 64 * 1024;
+const MAX_ALLOC_RETRIES: usize = 8;
+const COMMAND_HEAP_BYTES: usize = 48 * 1024;
 const MAX_INPUT_BYTES: usize = 32 * 1024;
 const MAX_SYSCALL_RETRIES: usize = 8;
+const MAX_TEMP_ATTEMPTS: usize = 16;
+const FIND_MAX_DEPTH: usize = 32;
+const FIND_MAX_NODES: usize = 1024;
+const FIND_MAX_OUTPUT_BYTES: usize = 32 * 1024;
+const FIND_MAX_WORK: usize = 64 * 1024;
 const EINTR: syscall::Word = 4;
 const EAGAIN: syscall::Word = 11;
+const EEXIST: syscall::Word = 17;
+const EIO: syscall::Word = 5;
+const ENOMEM: syscall::Word = 12;
 const EOVERFLOW: syscall::Word = 75;
 
 struct Heap {
     bytes: UnsafeCell<[u8; HEAP_BYTES]>,
     cursor: AtomicUsize,
+    limit: AtomicUsize,
 }
 
 unsafe impl Sync for Heap {}
 
+impl Heap {
+    const fn new() -> Self {
+        Self {
+            bytes: UnsafeCell::new([0; HEAP_BYTES]),
+            cursor: AtomicUsize::new(0),
+            limit: AtomicUsize::new(HEAP_BYTES),
+        }
+    }
+
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let base = self.bytes.get() as *mut u8 as usize;
+        let alignment_mask = layout.align() - 1;
+        let limit = self.limit.load(AtomicOrdering::Acquire).min(HEAP_BYTES);
+        for _ in 0..MAX_ALLOC_RETRIES {
+            let cursor = self.cursor.load(AtomicOrdering::Relaxed);
+            let Some(start) = base.checked_add(cursor) else {
+                return core::ptr::null_mut();
+            };
+            let Some(aligned) = start
+                .checked_add(alignment_mask)
+                .map(|value| value & !alignment_mask)
+            else {
+                return core::ptr::null_mut();
+            };
+            let Some(offset) = aligned.checked_sub(base) else {
+                return core::ptr::null_mut();
+            };
+            let Some(end) = offset.checked_add(layout.size()) else {
+                return core::ptr::null_mut();
+            };
+            if end > limit {
+                return core::ptr::null_mut();
+            }
+            if self
+                .cursor
+                .compare_exchange(cursor, end, AtomicOrdering::AcqRel, AtomicOrdering::Relaxed)
+                .is_ok()
+            {
+                return aligned as *mut u8;
+            }
+            core::hint::spin_loop();
+        }
+        core::ptr::null_mut()
+    }
+}
+
 struct BumpAllocator;
 
-static HEAP: Heap = Heap {
-    bytes: UnsafeCell::new([0; HEAP_BYTES]),
-    cursor: AtomicUsize::new(0),
-};
+static HEAP: Heap = Heap::new();
 
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let base = HEAP.bytes.get() as *mut u8 as usize;
-        let cursor = HEAP.cursor.load(AtomicOrdering::Relaxed);
-        let aligned = (base + cursor + layout.align() - 1) & !(layout.align() - 1);
-        let offset = aligned - base;
-        let Some(end) = offset.checked_add(layout.size()) else {
-            return core::ptr::null_mut();
-        };
-        if end > HEAP_BYTES {
-            return core::ptr::null_mut();
-        }
-        if HEAP
-            .cursor
-            .compare_exchange(cursor, end, AtomicOrdering::AcqRel, AtomicOrdering::Relaxed)
-            .is_ok()
-        {
-            aligned as *mut u8
-        } else {
-            self.alloc(layout)
-        }
+        HEAP.alloc(layout)
     }
 
     unsafe fn dealloc(&self, _pointer: *mut u8, _layout: Layout) {}
 }
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: BumpAllocator = BumpAllocator;
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: std::alloc::System = std::alloc::System;
+
+struct CommandBudget {
+    previous_limit: usize,
+}
+
+impl CommandBudget {
+    fn enter() -> Self {
+        let previous_limit = HEAP.limit.load(AtomicOrdering::Acquire);
+        let start = HEAP.cursor.load(AtomicOrdering::Acquire);
+        let limit = start
+            .saturating_add(COMMAND_HEAP_BYTES)
+            .min(HEAP_BYTES)
+            .min(previous_limit);
+        HEAP.limit.store(limit, AtomicOrdering::Release);
+        Self { previous_limit }
+    }
+}
+
+impl Drop for CommandBudget {
+    fn drop(&mut self) {
+        HEAP.limit
+            .store(self.previous_limit, AtomicOrdering::Release);
+    }
+}
+
+fn out_of_memory() -> syscall::Error {
+    syscall::Error(0u64.wrapping_sub(ENOMEM))
+}
+
+fn try_reserve<T>(output: &mut Vec<T>, additional: usize) -> Result<(), syscall::Error> {
+    output.try_reserve(additional).map_err(|_| out_of_memory())
+}
+
+fn try_reserve_exact<T>(output: &mut Vec<T>, additional: usize) -> Result<(), syscall::Error> {
+    output
+        .try_reserve_exact(additional)
+        .map_err(|_| out_of_memory())
+}
+
+fn try_push<T>(output: &mut Vec<T>, value: T) -> Result<(), syscall::Error> {
+    try_reserve(output, 1)?;
+    output.push(value);
+    Ok(())
+}
+
+fn try_extend<T: Clone>(output: &mut Vec<T>, input: &[T]) -> Result<(), syscall::Error> {
+    try_reserve(output, input.len())?;
+    output.extend_from_slice(input);
+    Ok(())
+}
+
+fn try_clone<T: Clone>(input: &[T]) -> Result<Vec<T>, syscall::Error> {
+    let mut output = Vec::new();
+    try_reserve_exact(&mut output, input.len())?;
+    output.extend_from_slice(input);
+    Ok(output)
+}
+
+const STARTUP_MAGIC: u64 = 0x4e4f525853544152;
+pub const STARTUP_VERSION: u64 = 1;
+const STARTUP_HEADER_WORDS: usize = 12;
+const STARTUP_HEADER_BYTES: usize = STARTUP_HEADER_WORDS * core::mem::size_of::<u64>();
+pub const STARTUP_MAX_BYTES: usize = 4096;
+pub const STARTUP_MAX_ARGUMENTS: usize = 16;
+pub const STARTUP_MAX_ENVIRONMENT: usize = 16;
+pub const STARTUP_REJECT_STATUS: i32 = 127;
+const STARTUP_AUXV_ENTRIES: usize = 3;
+const AT_PAGESZ: u64 = 6;
+const AT_ENTRY: u64 = 9;
+const PAGE_SIZE: u64 = 4096;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StartupBlock {
+    magic: u64,
+    version: u64,
+    header_size: u64,
+    block_size: u64,
+    argc: u64,
+    envc: u64,
+    argv_offset: u64,
+    envp_offset: u64,
+    auxv_offset: u64,
+    auxv_count: u64,
+    strings_offset: u64,
+    strings_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupError {
+    NullStack,
+    MisalignedStack,
+    InvalidHeader,
+    UnsupportedVersion,
+    InvalidSize,
+    TooManyArguments,
+    InvalidLayout,
+    InvalidAuxiliaryVector,
+    InvalidPointer,
+    UnterminatedString,
+}
 
 #[derive(Clone, Copy)]
 pub struct Startup {
     pub argc: usize,
-    pub argv: *const *const u8,
-    pub envp: *const *const u8,
+    pub envc: usize,
+    argv: usize,
+    envp: usize,
+    strings_end: usize,
 }
 
-pub unsafe fn startup_from_stack(stack: *const usize) -> Startup {
-    let argc = *stack;
-    let argv = stack.add(1) as *const *const u8;
-    let envp = argv.add(argc + 1);
-    Startup { argc, argv, envp }
-}
-
-unsafe fn c_string(pointer: *const u8) -> &'static [u8] {
-    if pointer.is_null() {
-        return &[];
+pub unsafe fn startup_from_stack(stack: *const usize) -> Result<Startup, StartupError> {
+    if stack.is_null() {
+        return Err(StartupError::NullStack);
     }
-    let mut length = 0;
-    while length < 4096 && *pointer.add(length) != 0 {
-        length += 1;
+    let base = stack as usize;
+    if base & (core::mem::align_of::<StartupBlock>() - 1) != 0 {
+        return Err(StartupError::MisalignedStack);
     }
-    core::slice::from_raw_parts(pointer, length)
+    let header = stack.cast::<StartupBlock>().read();
+    if header.magic != STARTUP_MAGIC {
+        return Err(StartupError::InvalidHeader);
+    }
+    if header.version != STARTUP_VERSION {
+        return Err(StartupError::UnsupportedVersion);
+    }
+    if header.header_size != STARTUP_HEADER_BYTES as u64 {
+        return Err(StartupError::InvalidHeader);
+    }
+    let block_size = usize_from_startup_word(header.block_size).ok_or(StartupError::InvalidSize)?;
+    if !(STARTUP_HEADER_BYTES..=STARTUP_MAX_BYTES).contains(&block_size) {
+        return Err(StartupError::InvalidSize);
+    }
+    let block_end = base
+        .checked_add(block_size)
+        .ok_or(StartupError::InvalidSize)?;
+    let argc = usize_from_startup_word(header.argc).ok_or(StartupError::TooManyArguments)?;
+    let envc = usize_from_startup_word(header.envc).ok_or(StartupError::TooManyArguments)?;
+    if argc > STARTUP_MAX_ARGUMENTS || envc > STARTUP_MAX_ENVIRONMENT {
+        return Err(StartupError::TooManyArguments);
+    }
+
+    let argv_bytes = argc
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(core::mem::size_of::<u64>()))
+        .ok_or(StartupError::InvalidLayout)?;
+    let envp_bytes = envc
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(core::mem::size_of::<u64>()))
+        .ok_or(StartupError::InvalidLayout)?;
+    let auxv_bytes = STARTUP_AUXV_ENTRIES
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(core::mem::size_of::<u64>()))
+        .ok_or(StartupError::InvalidLayout)?;
+    let argv_offset = STARTUP_HEADER_BYTES;
+    let envp_offset = argv_offset
+        .checked_add(argv_bytes)
+        .ok_or(StartupError::InvalidLayout)?;
+    let auxv_offset = envp_offset
+        .checked_add(envp_bytes)
+        .ok_or(StartupError::InvalidLayout)?;
+    if header.argv_offset != argv_offset as u64
+        || header.envp_offset != envp_offset as u64
+        || header.auxv_offset != auxv_offset as u64
+        || header.auxv_count != STARTUP_AUXV_ENTRIES as u64
+    {
+        return Err(StartupError::InvalidLayout);
+    }
+    let argv = bounded_array(base, header.argv_offset, argv_bytes, block_end)?;
+    let envp = bounded_array(base, header.envp_offset, envp_bytes, block_end)?;
+    let auxv = bounded_array(base, header.auxv_offset, auxv_bytes, block_end)?;
+
+    let strings_offset =
+        usize_from_startup_word(header.strings_offset).ok_or(StartupError::InvalidLayout)?;
+    let strings_size =
+        usize_from_startup_word(header.strings_size).ok_or(StartupError::InvalidLayout)?;
+    if strings_offset < auxv_offset + auxv_bytes
+        || strings_offset > block_size
+        || strings_size != block_size - strings_offset
+    {
+        return Err(StartupError::InvalidLayout);
+    }
+    let strings_start = base
+        .checked_add(strings_offset)
+        .ok_or(StartupError::InvalidLayout)?;
+    let strings_end = strings_start
+        .checked_add(strings_size)
+        .ok_or(StartupError::InvalidLayout)?;
+    if strings_end != block_end {
+        return Err(StartupError::InvalidLayout);
+    }
+
+    if read_word(auxv, 0) != AT_PAGESZ
+        || read_word(auxv, 1) != PAGE_SIZE
+        || read_word(auxv, 2) != AT_ENTRY
+        || read_word(auxv, 3) == 0
+        || read_word(auxv, 4) != 0
+        || read_word(auxv, 5) != 0
+    {
+        return Err(StartupError::InvalidAuxiliaryVector);
+    }
+    for index in 0..argc {
+        validate_string(read_word(argv, index), strings_start, strings_end)?;
+    }
+    if read_word(argv, argc) != 0 {
+        return Err(StartupError::InvalidLayout);
+    }
+    for index in 0..envc {
+        validate_string(read_word(envp, index), strings_start, strings_end)?;
+    }
+    if read_word(envp, envc) != 0 {
+        return Err(StartupError::InvalidLayout);
+    }
+    Ok(Startup {
+        argc,
+        envc,
+        argv,
+        envp,
+        strings_end,
+    })
 }
 
-pub unsafe fn collect_args(startup: Startup) -> Vec<&'static [u8]> {
-    let mut result = Vec::new();
-    for index in 0..startup.argc.min(64) {
-        result.push(c_string(*startup.argv.add(index)));
-    }
-    result
+fn usize_from_startup_word(value: u64) -> Option<usize> {
+    (value <= usize::MAX as u64).then_some(value as usize)
 }
 
-pub unsafe fn collect_environment(startup: Startup) -> Vec<&'static [u8]> {
-    let mut result = Vec::new();
-    for index in 0..64 {
-        let pointer = *startup.envp.add(index);
-        if pointer.is_null() {
-            break;
+fn bounded_array(
+    base: usize,
+    offset: u64,
+    length: usize,
+    block_end: usize,
+) -> Result<usize, StartupError> {
+    let offset = usize_from_startup_word(offset).ok_or(StartupError::InvalidLayout)?;
+    if !offset.is_multiple_of(core::mem::size_of::<u64>()) {
+        return Err(StartupError::InvalidLayout);
+    }
+    let start = base
+        .checked_add(offset)
+        .ok_or(StartupError::InvalidLayout)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(StartupError::InvalidLayout)?;
+    if end > block_end {
+        return Err(StartupError::InvalidLayout);
+    }
+    Ok(start)
+}
+
+unsafe fn read_word(address: usize, index: usize) -> u64 {
+    let offset = index
+        .checked_mul(core::mem::size_of::<u64>())
+        .expect("validated startup array index");
+    core::ptr::read_unaligned((address + offset) as *const u64)
+}
+
+unsafe fn validate_string(
+    pointer: u64,
+    strings_start: usize,
+    strings_end: usize,
+) -> Result<(), StartupError> {
+    let pointer = usize_from_startup_word(pointer).ok_or(StartupError::InvalidPointer)?;
+    if pointer < strings_start || pointer >= strings_end {
+        return Err(StartupError::InvalidPointer);
+    }
+    let mut cursor = pointer;
+    while cursor < strings_end {
+        if (cursor as *const u8).read() == 0 {
+            return Ok(());
         }
-        result.push(c_string(pointer));
+        cursor += 1;
     }
-    result
+    Err(StartupError::UnterminatedString)
+}
+
+unsafe fn c_string(pointer: u64, strings_end: usize) -> &'static [u8] {
+    let pointer = pointer as usize;
+    let mut end = pointer;
+    while end < strings_end && (end as *const u8).read() != 0 {
+        end += 1;
+    }
+    core::slice::from_raw_parts(pointer as *const u8, end - pointer)
+}
+
+pub fn collect_args(startup: Startup) -> Result<Vec<&'static [u8]>, syscall::Error> {
+    let mut result = Vec::new();
+    try_reserve_exact(&mut result, startup.argc)?;
+    for index in 0..startup.argc {
+        result.push(unsafe { c_string(read_word(startup.argv, index), startup.strings_end) });
+    }
+    Ok(result)
+}
+
+pub fn collect_environment(startup: Startup) -> Result<Vec<&'static [u8]>, syscall::Error> {
+    let mut result = Vec::new();
+    try_reserve_exact(&mut result, startup.envc)?;
+    for index in 0..startup.envc {
+        result.push(unsafe { c_string(read_word(startup.envp, index), startup.strings_end) });
+    }
+    Ok(result)
 }
 
 fn write_all(fd: syscall::Word, bytes: &[u8]) -> Result<(), syscall::Error> {
     let mut offset = 0;
     while offset < bytes.len() {
-        let count = write_retry(fd, bytes[offset..].as_ptr(), bytes.len() - offset)?;
-        if count == 0 {
-            return Err(syscall::Error(u64::MAX - 5));
+        let remaining = bytes.len() - offset;
+        let count = write_retry(fd, bytes[offset..].as_ptr(), remaining)?;
+        if count == 0 || count > remaining {
+            return Err(syscall::Error(0u64.wrapping_sub(EIO)));
         }
         offset += count;
     }
@@ -420,30 +730,46 @@ fn read_retry(fd: syscall::Word, buffer: *mut u8, length: usize) -> Result<usize
     Err(syscall::Error(0u64.wrapping_sub(EAGAIN)))
 }
 
-fn read_all(fd: syscall::Word, output: &mut Vec<u8>) -> Result<(), syscall::Error> {
+fn read_all_with(
+    output: &mut Vec<u8>,
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, syscall::Error>,
+) -> Result<(), syscall::Error> {
+    if output.len() > MAX_INPUT_BYTES {
+        return Err(syscall::Error(0u64.wrapping_sub(EOVERFLOW)));
+    }
+    let additional = MAX_INPUT_BYTES.saturating_sub(output.capacity());
+    try_reserve_exact(output, additional)?;
     let mut buffer = [0u8; 1024];
     loop {
-        match read_retry(fd, buffer.as_mut_ptr(), buffer.len())? {
+        match read(&mut buffer)? {
             0 => return Ok(()),
             count => {
+                if count > buffer.len() {
+                    return Err(syscall::Error(0u64.wrapping_sub(EIO)));
+                }
                 let Some(new_length) = output.len().checked_add(count) else {
                     return Err(syscall::Error(0u64.wrapping_sub(EOVERFLOW)));
                 };
                 if new_length > MAX_INPUT_BYTES {
                     return Err(syscall::Error(0u64.wrapping_sub(EOVERFLOW)));
                 }
-                output.extend_from_slice(&buffer[..count]);
+                try_extend(output, &buffer[..count])?;
             }
         }
     }
 }
 
-fn append_u64(output: &mut Vec<u8>, mut value: u64) {
+fn read_all(fd: syscall::Word, output: &mut Vec<u8>) -> Result<(), syscall::Error> {
+    read_all_with(output, |buffer| {
+        read_retry(fd, buffer.as_mut_ptr(), buffer.len())
+    })
+}
+
+fn append_u64(output: &mut Vec<u8>, mut value: u64) -> Result<(), syscall::Error> {
     let mut digits = [0u8; 20];
     let mut count = 0;
     if value == 0 {
-        output.push(b'0');
-        return;
+        return try_push(output, b'0');
     }
     while value != 0 {
         digits[count] = b'0' + (value % 10) as u8;
@@ -452,23 +778,41 @@ fn append_u64(output: &mut Vec<u8>, mut value: u64) {
     }
     while count != 0 {
         count -= 1;
-        output.push(digits[count]);
+        try_push(output, digits[count])?;
     }
+    Ok(())
+}
+
+fn write_u64(fd: syscall::Word, mut value: u64) -> Result<(), syscall::Error> {
+    let mut digits = [0u8; 20];
+    let mut count = digits.len();
+    if value == 0 {
+        return write_all(fd, b"0");
+    }
+    while value != 0 {
+        count -= 1;
+        digits[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    write_all(fd, &digits[count..])
+}
+
+fn write_line(fd: syscall::Word, bytes: &[u8]) -> Result<(), syscall::Error> {
+    write_all(fd, bytes)?;
+    write_all(fd, b"\n")
 }
 
 fn report(command: &[u8], reason: &[u8], error: Option<syscall::Error>) -> i32 {
-    let mut line = Vec::new();
-    line.extend_from_slice(b"coreutils: ");
-    line.extend_from_slice(command);
-    line.extend_from_slice(b": ");
-    line.extend_from_slice(reason);
+    let _ = write_all(2, b"coreutils: ");
+    let _ = write_all(2, command);
+    let _ = write_all(2, b": ");
+    let _ = write_all(2, reason);
     if let Some(error) = error {
-        line.extend_from_slice(b" (errno ");
-        append_u64(&mut line, error.errno());
-        line.push(b')');
+        let _ = write_all(2, b" (errno ");
+        let _ = write_u64(2, error.errno());
+        let _ = write_all(2, b")");
     }
-    line.push(b'\n');
-    let _ = write_all(2, &line);
+    let _ = write_all(2, b"\n");
     1
 }
 
@@ -487,33 +831,76 @@ fn env_value<'a>(environment: &'a [&'a [u8]], name: &[u8]) -> Option<&'a [u8]> {
 fn absolute_path<'a>(
     raw: &[u8],
     environment: &[&[u8]],
-    output: &'a mut Vec<u8>,
+    output: &'a mut [u8; syscall::MAX_PATH],
 ) -> Result<&'a [u8], &'static [u8]> {
     if raw.is_empty() || raw.contains(&0) {
         return Err(b"empty or NUL path");
     }
-    output.clear();
-    if raw.first() == Some(&b'/') {
-        output.extend_from_slice(raw);
+    let cwd = if raw.first() == Some(&b'/') {
+        &[][..]
     } else {
         let cwd = env_value(environment, b"PWD").unwrap_or(b"/");
-        if cwd.first() != Some(&b'/') {
+        if cwd.first() != Some(&b'/') || cwd.contains(&0) {
             return Err(b"PWD is not absolute");
         }
-        output.extend_from_slice(cwd);
-        if output.last() != Some(&b'/') {
-            output.push(b'/');
+        cwd
+    };
+    for component in cwd
+        .split(|byte| *byte == b'/')
+        .chain(raw.split(|byte| *byte == b'/'))
+    {
+        if component.len() > syscall::NAME_MAX {
+            return Err(b"path component is too long");
         }
-        output.extend_from_slice(raw);
     }
-    if output.len() > syscall::MAX_PATH {
+    let separator = usize::from(!cwd.is_empty() && cwd.last() != Some(&b'/'));
+    let length = cwd
+        .len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(raw.len()))
+        .ok_or(&b"path is too long"[..])?;
+    if length > syscall::MAX_PATH {
         return Err(b"path is too long");
     }
-    Ok(output)
+    if cwd.is_empty() {
+        output[..raw.len()].copy_from_slice(raw);
+    } else {
+        output[..cwd.len()].copy_from_slice(cwd);
+        if separator != 0 {
+            output[cwd.len()] = b'/';
+        }
+        output[cwd.len() + separator..length].copy_from_slice(raw);
+    }
+    Ok(&output[..length])
 }
 
 fn open_read(path: &[u8]) -> Result<syscall::Word, syscall::Error> {
     syscall::open(path, syscall::OPEN_READ, 0)
+}
+
+fn temporary_path(
+    destination: &[u8],
+    attempt: usize,
+    output: &mut [u8; syscall::MAX_PATH],
+) -> Option<usize> {
+    if attempt >= MAX_TEMP_ATTEMPTS {
+        return None;
+    }
+    let Some(separator) = destination.iter().rposition(|byte| *byte == b'/') else {
+        return None;
+    };
+    let suffix = b".norx-cp-";
+    let prefix_length = separator + 1;
+    let length = prefix_length
+        .checked_add(suffix.len())
+        .and_then(|length| length.checked_add(1))?;
+    if length > syscall::MAX_PATH {
+        return None;
+    }
+    output[..prefix_length].copy_from_slice(&destination[..prefix_length]);
+    output[prefix_length..prefix_length + suffix.len()].copy_from_slice(suffix);
+    output[length - 1] = b"0123456789abcdef"[attempt];
+    Some(length)
 }
 
 fn copy_fd(input: syscall::Word, output: syscall::Word) -> Result<(), syscall::Error> {
@@ -585,13 +972,15 @@ fn command_path<'a>(
     command: &[u8],
     raw: &[u8],
     environment: &[&[u8]],
-    path: &'a mut Vec<u8>,
+    path: &'a mut [u8; syscall::MAX_PATH],
 ) -> Result<&'a [u8], i32> {
+    // Keep lexical aliases intact. The kernel VFS resolves them in its
+    // namespace, and this ABI has no symlink nodes to follow.
     absolute_path(raw, environment, path).map_err(|reason| report(command, reason, None))
 }
 
 fn cat(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
-    let mut path = Vec::new();
+    let mut path = [0u8; syscall::MAX_PATH];
     if args
         .iter()
         .any(|arg| arg.first() == Some(&b'-') && *arg != b"-" && *arg != b"--")
@@ -639,57 +1028,73 @@ fn cat(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
 fn echo(command: &[u8], args: &[&[u8]]) -> i32 {
     let no_newline = args.first() == Some(&b"-n".as_slice());
     let args = if no_newline { &args[1..] } else { args };
-    let mut output = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         if index != 0 {
-            output.push(b' ');
+            if let Err(error) = write_all(1, b" ") {
+                return report(command, b"write failed", Some(error));
+            }
         }
-        output.extend_from_slice(arg);
+        if let Err(error) = write_all(1, arg) {
+            return report(command, b"write failed", Some(error));
+        }
     }
     if !no_newline {
-        output.push(b'\n');
+        if let Err(error) = write_all(1, b"\n") {
+            return report(command, b"write failed", Some(error));
+        }
     }
-    match write_all(1, &output) {
-        Ok(()) => 0,
-        Err(error) => report(command, b"write failed", Some(error)),
-    }
+    0
 }
 
 fn env_command(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
-    let mut values = environment.to_vec();
     let mut index = 0;
     if args.first() == Some(&b"-i".as_slice()) {
-        values.clear();
         index = 1;
     }
     if args.get(index) == Some(&b"--".as_slice()) {
         index += 1;
     }
-    while let Some(arg) = args.get(index) {
+    let overrides = &args[index..];
+    for arg in overrides {
         let Some(separator) = arg.iter().position(|byte| *byte == b'=') else {
             return usage(command, b"command execution is not part of env yet");
         };
         if separator == 0 {
             return usage(command, b"invalid empty environment name");
         }
-        values.retain(|entry| {
-            entry
-                .iter()
-                .position(|byte| *byte == b'=')
-                .is_none_or(|position| entry[..position] != arg[..separator])
+    }
+    if args.first() != Some(&b"-i".as_slice()) {
+        for entry in environment {
+            let overridden =
+                entry
+                    .iter()
+                    .position(|byte| *byte == b'=')
+                    .is_some_and(|_separator| {
+                        overrides.iter().any(|arg| {
+                            let separator = arg.iter().position(|byte| *byte == b'=').unwrap();
+                            entry[..separator] == arg[..separator]
+                        })
+                    });
+            if !overridden {
+                if let Err(error) = write_line(1, entry) {
+                    return report(command, b"write failed", Some(error));
+                }
+            }
+        }
+    }
+    for (override_index, arg) in overrides.iter().enumerate() {
+        let separator = arg.iter().position(|byte| *byte == b'=').unwrap();
+        let is_last = overrides[override_index + 1..].iter().all(|later| {
+            let later_separator = later.iter().position(|byte| *byte == b'=').unwrap();
+            later[..later_separator] != arg[..separator]
         });
-        values.push(*arg);
-        index += 1;
+        if is_last {
+            if let Err(error) = write_line(1, arg) {
+                return report(command, b"write failed", Some(error));
+            }
+        }
     }
-    let mut output = Vec::new();
-    for entry in values {
-        output.extend_from_slice(entry);
-        output.push(b'\n');
-    }
-    match write_all(1, &output) {
-        Ok(()) => 0,
-        Err(error) => report(command, b"write failed", Some(error)),
-    }
+    0
 }
 
 fn pwd(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
@@ -697,9 +1102,7 @@ fn pwd(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
         return usage(command, b"no arguments expected");
     }
     let value = env_value(environment, b"PWD").unwrap_or(b"/");
-    let mut output = Vec::from(value);
-    output.push(b'\n');
-    match write_all(1, &output) {
+    match write_line(1, value) {
         Ok(()) => 0,
         Err(error) => report(command, b"write failed", Some(error)),
     }
@@ -709,38 +1112,42 @@ fn stat_one(
     command: &[u8],
     raw: &[u8],
     environment: &[&[u8]],
-    path: &mut Vec<u8>,
+    path: &mut [u8; syscall::MAX_PATH],
 ) -> Result<(), i32> {
     let absolute = command_path(command, raw, environment, path)?;
     let mut value = syscall::Stat::default();
     syscall::stat(absolute, &mut value)
         .map_err(|error| report(command, b"stat failed", Some(error)))?;
-    let mut output = Vec::new();
-    output.extend_from_slice(b"  File: ");
-    output.extend_from_slice(raw);
-    output.extend_from_slice(b"\n  Size: ");
-    append_u64(&mut output, value.size);
-    output.extend_from_slice(b"\n  Type: ");
-    output.extend_from_slice(if value.kind == syscall::STAT_DIRECTORY {
-        b"directory"
-    } else {
-        b"regular"
-    });
-    output.extend_from_slice(b"\n  Mode: ");
-    append_u64(&mut output, value.mode as u64);
-    output.extend_from_slice(b"\n Links: ");
-    append_u64(&mut output, value.links as u64);
-    output.extend_from_slice(b"\n Inode: ");
-    append_u64(&mut output, value.inode as u64);
-    output.push(b'\n');
-    write_all(1, &output).map_err(|error| report(command, b"write failed", Some(error)))
+    write_all(1, b"  File: ")
+        .and_then(|_| write_all(1, raw))
+        .and_then(|_| write_all(1, b"\n  Size: "))
+        .and_then(|_| write_u64(1, value.size))
+        .and_then(|_| write_all(1, b"\n  Type: "))
+        .and_then(|_| {
+            write_all(
+                1,
+                if value.kind == syscall::STAT_DIRECTORY {
+                    b"directory"
+                } else {
+                    b"regular"
+                },
+            )
+        })
+        .and_then(|_| write_all(1, b"\n  Mode: "))
+        .and_then(|_| write_u64(1, value.mode as u64))
+        .and_then(|_| write_all(1, b"\n Links: "))
+        .and_then(|_| write_u64(1, value.links as u64))
+        .and_then(|_| write_all(1, b"\n Inode: "))
+        .and_then(|_| write_u64(1, value.inode as u64))
+        .and_then(|_| write_all(1, b"\n"))
+        .map_err(|error| report(command, b"write failed", Some(error)))
 }
 
 fn stat_command(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     if args.is_empty() {
         return usage(command, b"operand required");
     }
-    let mut path = Vec::new();
+    let mut path = [0u8; syscall::MAX_PATH];
     let mut status = 0;
     for raw in args {
         if stat_one(command, raw, environment, &mut path).is_err() {
@@ -754,7 +1161,7 @@ fn ls_one(
     command: &[u8],
     raw: &[u8],
     environment: &[&[u8]],
-    path: &mut Vec<u8>,
+    path: &mut [u8; syscall::MAX_PATH],
     all: bool,
     long: bool,
 ) -> Result<(), i32> {
@@ -763,10 +1170,7 @@ fn ls_one(
     syscall::stat(absolute, &mut value)
         .map_err(|error| report(command, b"stat failed", Some(error)))?;
     if value.kind != syscall::STAT_DIRECTORY {
-        let mut output = Vec::from(raw);
-        output.push(b'\n');
-        return write_all(1, &output)
-            .map_err(|error| report(command, b"write failed", Some(error)));
+        return write_line(1, raw).map_err(|error| report(command, b"write failed", Some(error)));
     }
     let mut entries = [syscall::DirEntry::default(); 16];
     let count = syscall::read_dir(absolute, &mut entries)
@@ -775,9 +1179,10 @@ fn ls_one(
         return Err(report(command, b"malformed directory count", None));
     }
     for entry in entries.iter().take(count) {
-        if entry.name_length as usize > syscall::NAME_MAX {
-            return Err(report(command, b"malformed directory entry", None));
-        }
+        usize::try_from(entry.name_length)
+            .ok()
+            .filter(|length| *length <= syscall::NAME_MAX)
+            .ok_or_else(|| report(command, b"malformed directory entry", None))?;
     }
     entries[..count].sort_unstable_by(|left, right| {
         left.name[..left.name_length as usize].cmp(&right.name[..right.name_length as usize])
@@ -787,27 +1192,30 @@ fn ls_one(
             .ok()
             .filter(|length| *length <= syscall::NAME_MAX)
             .ok_or_else(|| report(command, b"malformed directory entry", None))?;
-        let mut output = Vec::from(&entry.name[..length]);
-        if !all && output.first() == Some(&b'.') {
+        let name = &entry.name[..length];
+        if !all && name.first() == Some(&b'.') {
             continue;
         }
         if long {
-            let mut formatted = Vec::new();
-            formatted.extend_from_slice(if entry.kind == syscall::STAT_DIRECTORY {
-                b"d"
-            } else {
-                b"-"
-            });
-            formatted.extend_from_slice(b" ");
-            append_u64(&mut formatted, entry.links as u64);
-            formatted.extend_from_slice(b" ");
-            append_u64(&mut formatted, entry.size);
-            formatted.extend_from_slice(b" ");
-            formatted.extend_from_slice(&output);
-            output = formatted;
+            write_all(
+                1,
+                if entry.kind == syscall::STAT_DIRECTORY {
+                    b"d"
+                } else {
+                    b"-"
+                },
+            )
+            .and_then(|_| write_all(1, b" "))
+            .and_then(|_| write_u64(1, entry.links as u64))
+            .and_then(|_| write_all(1, b" "))
+            .and_then(|_| write_u64(1, entry.size))
+            .and_then(|_| write_all(1, b" "))
+            .and_then(|_| write_all(1, name))
+            .and_then(|_| write_all(1, b"\n"))
+            .map_err(|error| report(command, b"write failed", Some(error)))?;
+        } else {
+            write_line(1, name).map_err(|error| report(command, b"write failed", Some(error)))?;
         }
-        output.push(b'\n');
-        write_all(1, &output).map_err(|error| report(command, b"write failed", Some(error)))?;
     }
     Ok(())
 }
@@ -840,7 +1248,7 @@ fn ls(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     } else {
         inputs
     };
-    let mut path = Vec::new();
+    let mut path = [0u8; syscall::MAX_PATH];
     let mut status = 0;
     for raw in inputs {
         if ls_one(command, raw, environment, &mut path, all, long).is_err() {
@@ -852,34 +1260,28 @@ fn ls(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
 
 fn mkdir(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     let mut parents = false;
-    let mut paths = Vec::new();
     for arg in args {
         if *arg == b"-p" {
             parents = true;
-        } else {
-            paths.push(*arg);
         }
     }
-    if paths.is_empty() {
+    if !args.iter().any(|arg| *arg != b"-p".as_slice()) {
         return usage(command, b"operand required");
     }
-    let mut path = Vec::new();
+    let mut path = [0u8; syscall::MAX_PATH];
     let mut status = 0;
-    for raw in paths {
+    for raw in args.iter().filter(|arg| **arg != b"-p") {
         let absolute = match command_path(command, raw, environment, &mut path) {
-            Ok(value) => value.to_vec(),
+            Ok(value) => value,
             Err(error) => {
                 status = error;
                 continue;
             }
         };
         if parents {
-            let mut prefix = Vec::new();
             for (index, byte) in absolute.iter().enumerate() {
                 if *byte == b'/' && index != 0 {
-                    prefix.clear();
-                    prefix.extend_from_slice(&absolute[..index]);
-                    let _ = syscall::mkdir(&prefix, 0o755);
+                    let _ = syscall::mkdir(&absolute[..index], 0o755);
                 }
             }
         }
@@ -906,11 +1308,11 @@ fn simple_path_command(
     if args.is_empty() {
         return usage(command, b"operand required");
     }
-    let mut path = Vec::new();
+    let mut path = [0u8; syscall::MAX_PATH];
     let mut status = 0;
     for raw in args {
         let absolute = match command_path(command, raw, environment, &mut path) {
-            Ok(value) => value.to_vec(),
+            Ok(value) => value,
             Err(error) => {
                 status = error;
                 continue;
@@ -927,50 +1329,97 @@ fn cp(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     if args.len() != 2 {
         return usage(command, b"exactly source and destination are required");
     }
-    let mut source = Vec::new();
-    let mut destination = Vec::new();
-    let source = match command_path(command, args[0], environment, &mut source) {
-        Ok(value) => value.to_vec(),
+    let mut source_path = [0u8; syscall::MAX_PATH];
+    let mut destination_path = [0u8; syscall::MAX_PATH];
+    let source = match command_path(command, args[0], environment, &mut source_path) {
+        Ok(value) => value,
         Err(error) => return error,
     };
-    let destination = match command_path(command, args[1], environment, &mut destination) {
-        Ok(value) => value.to_vec(),
+    let destination = match command_path(command, args[1], environment, &mut destination_path) {
+        Ok(value) => value,
         Err(error) => return error,
     };
-    let mut source_stat = syscall::Stat::default();
-    if let Err(error) = syscall::stat(&source, &mut source_stat) {
-        return report(command, b"stat source failed", Some(error));
-    }
     if source == destination {
-        return report(command, b"source and destination are the same file", None);
-    }
-    let mut destination_stat = syscall::Stat::default();
-    if syscall::stat(&destination, &mut destination_stat).is_ok()
-        && source_stat.inode == destination_stat.inode
-    {
         return report(command, b"source and destination are the same file", None);
     }
     let input = match open_read(&source) {
         Ok(fd) => fd,
         Err(error) => return report(command, b"open source failed", Some(error)),
     };
-    let output = match syscall::open(
-        &destination,
-        syscall::OPEN_WRITE | syscall::OPEN_CREATE | syscall::OPEN_TRUNCATE,
-        0o666,
-    ) {
-        Ok(fd) => fd,
+    let mut source_stat = syscall::Stat::default();
+    if let Err(error) = syscall::fstat(input, &mut source_stat) {
+        let _ = syscall::close(input);
+        return report(command, b"stat source failed", Some(error));
+    }
+    if source_stat.kind != syscall::STAT_REGULAR {
+        let _ = syscall::close(input);
+        return report(command, b"source is not a regular file", None);
+    }
+    let mut destination_stat = syscall::Stat::default();
+    match syscall::stat(&destination, &mut destination_stat) {
+        Ok(()) if source_stat.inode == destination_stat.inode => {
+            let _ = syscall::close(input);
+            return report(command, b"source and destination are the same file", None);
+        }
+        Ok(()) => {}
+        Err(error) if error.errno() == 2 => {}
         Err(error) => {
             let _ = syscall::close(input);
-            return report(command, b"open destination failed", Some(error));
+            return report(command, b"stat destination failed", Some(error));
         }
+    }
+
+    let mut temporary = [0u8; syscall::MAX_PATH];
+    let mut temporary_length = 0;
+    let mut output = None;
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let Some(length) = temporary_path(&destination, attempt, &mut temporary) else {
+            let _ = syscall::close(input);
+            return report(command, b"temporary path is too long", None);
+        };
+        temporary_length = length;
+        let temporary = &temporary[..temporary_length];
+        match syscall::open(
+            temporary,
+            syscall::OPEN_WRITE | syscall::OPEN_CREATE | syscall::OPEN_EXCLUSIVE,
+            0o666,
+        ) {
+            Ok(fd) => {
+                output = Some(fd);
+                break;
+            }
+            Err(error) if error.errno() == EEXIST => {}
+            Err(error) => {
+                let _ = syscall::close(input);
+                return report(command, b"open temporary failed", Some(error));
+            }
+        }
+    }
+    let Some(output) = output else {
+        let _ = syscall::close(input);
+        return report(command, b"no temporary path available", None);
     };
     let result = copy_fd(input, output);
     let _ = syscall::close(input);
-    let _ = syscall::close(output);
     match result {
-        Ok(()) => 0,
-        Err(error) => report(command, b"copy failed", Some(error)),
+        Ok(()) => {
+            if let Err(error) = syscall::close(output) {
+                let _ = syscall::unlink(&temporary[..temporary_length]);
+                return report(command, b"close temporary failed", Some(error));
+            }
+            match syscall::rename(&temporary[..temporary_length], &destination) {
+                Ok(()) => 0,
+                Err(error) => {
+                    let _ = syscall::unlink(&temporary[..temporary_length]);
+                    report(command, b"rename failed", Some(error))
+                }
+            }
+        }
+        Err(error) => {
+            let _ = syscall::close(output);
+            let _ = syscall::unlink(&temporary[..temporary_length]);
+            report(command, b"copy failed", Some(error))
+        }
     }
 }
 
@@ -978,11 +1427,11 @@ fn touch(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     if args.is_empty() {
         return usage(command, b"operand required");
     }
-    let mut path = Vec::new();
+    let mut path = [0u8; syscall::MAX_PATH];
     let mut status = 0;
     for raw in args {
         let absolute = match command_path(command, raw, environment, &mut path) {
-            Ok(value) => value.to_vec(),
+            Ok(value) => value,
             Err(error) => {
                 status = error;
                 continue;
@@ -1009,14 +1458,14 @@ fn ln(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     if args.len() != 2 {
         return usage(command, b"exactly source and destination are required");
     }
-    let mut old = Vec::new();
-    let mut new = Vec::new();
-    let old = match command_path(command, args[0], environment, &mut old) {
-        Ok(value) => value.to_vec(),
+    let mut old_path = [0u8; syscall::MAX_PATH];
+    let mut new_path = [0u8; syscall::MAX_PATH];
+    let old = match command_path(command, args[0], environment, &mut old_path) {
+        Ok(value) => value,
         Err(error) => return error,
     };
-    let new = match command_path(command, args[1], environment, &mut new) {
-        Ok(value) => value.to_vec(),
+    let new = match command_path(command, args[1], environment, &mut new_path) {
+        Ok(value) => value,
         Err(error) => return error,
     };
     match syscall::link(&old, &new) {
@@ -1025,49 +1474,193 @@ fn ln(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     }
 }
 
+struct FindState {
+    nodes: usize,
+    output_bytes: usize,
+    work: usize,
+    directories: [u32; FIND_MAX_NODES],
+    directory_count: usize,
+}
+
+impl FindState {
+    fn new() -> Self {
+        Self {
+            nodes: 0,
+            output_bytes: 0,
+            work: 0,
+            directories: [0; FIND_MAX_NODES],
+            directory_count: 0,
+        }
+    }
+
+    fn charge_work(&mut self, units: usize) -> bool {
+        let Some(work) = self.work.checked_add(units) else {
+            return false;
+        };
+        if work > FIND_MAX_WORK {
+            return false;
+        }
+        self.work = work;
+        true
+    }
+
+    fn visit_node(&mut self) -> bool {
+        let Some(nodes) = self.nodes.checked_add(1) else {
+            return false;
+        };
+        if nodes > FIND_MAX_NODES {
+            return false;
+        }
+        self.nodes = nodes;
+        true
+    }
+
+    fn reserve_output(&mut self, bytes: usize) -> bool {
+        let Some(output_bytes) = self.output_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if output_bytes > FIND_MAX_OUTPUT_BYTES {
+            return false;
+        }
+        self.output_bytes = output_bytes;
+        true
+    }
+
+    fn visit_directory(&mut self, inode: u32) -> Option<bool> {
+        if self.directories[..self.directory_count]
+            .iter()
+            .any(|visited| *visited == inode)
+        {
+            return Some(false);
+        }
+        let slot = self.directory_count;
+        if slot == self.directories.len() {
+            return None;
+        }
+        self.directories[slot] = inode;
+        self.directory_count += 1;
+        Some(true)
+    }
+}
+
 fn find_visit(
     command: &[u8],
-    path: &[u8],
+    path: &mut [u8; syscall::MAX_PATH],
+    path_length: usize,
     name_filter: Option<&[u8]>,
     type_filter: Option<u8>,
-    output: &mut Vec<u8>,
+    state: &mut FindState,
     depth: usize,
 ) -> Result<(), i32> {
-    if depth > 32 {
+    if depth > FIND_MAX_DEPTH {
         return Err(report(command, b"directory depth exceeded", None));
     }
+    if !state.charge_work(1) {
+        return Err(report(command, b"work budget exceeded", None));
+    }
+    if !state.visit_node() {
+        return Err(report(command, b"visited node budget exceeded", None));
+    }
     let mut stat = syscall::Stat::default();
-    syscall::stat(path, &mut stat).map_err(|error| report(command, b"stat failed", Some(error)))?;
-    let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
-    if name_filter.map_or(true, |filter| glob_matches(filter, basename))
-        && type_filter.map_or(true, |kind| {
-            (kind == b'f' && stat.kind == syscall::STAT_REGULAR)
-                || (kind == b'd' && stat.kind == syscall::STAT_DIRECTORY)
+    syscall::stat(&path[..path_length], &mut stat)
+        .map_err(|error| report(command, b"stat failed", Some(error)))?;
+    if stat.kind == syscall::STAT_DIRECTORY {
+        match state.visit_directory(stat.inode) {
+            Some(true) => {}
+            Some(false) => return Err(report(command, b"directory cycle detected", None)),
+            None => return Err(report(command, b"visited node budget exceeded", None)),
+        }
+    }
+    let basename = path[..path_length]
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(&path[..path_length]);
+    let match_work = name_filter
+        .map(|filter| {
+            filter
+                .len()
+                .saturating_mul(basename.len())
+                .saturating_add(filter.len())
+                .saturating_add(1)
         })
-    {
-        output.extend_from_slice(path);
-        output.push(b'\n');
+        .unwrap_or(1);
+    if !state.charge_work(match_work) {
+        return Err(report(command, b"work budget exceeded", None));
+    }
+    let name_matches = name_filter.map_or(true, |filter| glob_matches(filter, basename));
+    let type_matches = type_filter.map_or(true, |kind| {
+        (kind == b'f' && stat.kind == syscall::STAT_REGULAR)
+            || (kind == b'd' && stat.kind == syscall::STAT_DIRECTORY)
+    });
+    if name_matches && type_matches {
+        let line_length = path_length
+            .checked_add(1)
+            .ok_or_else(|| report(command, b"output budget exceeded", None))?;
+        if !state.reserve_output(line_length) {
+            return Err(report(command, b"output budget exceeded", None));
+        }
+        if !state.charge_work(line_length) {
+            return Err(report(command, b"work budget exceeded", None));
+        }
+        write_all(1, &path[..path_length])
+            .map_err(|error| report(command, b"write failed", Some(error)))?;
+        write_all(1, b"\n").map_err(|error| report(command, b"write failed", Some(error)))?;
     }
     if stat.kind != syscall::STAT_DIRECTORY {
         return Ok(());
     }
     let mut entries = [syscall::DirEntry::default(); 16];
-    let count = syscall::read_dir(path, &mut entries)
+    if !state.charge_work(1) {
+        return Err(report(command, b"work budget exceeded", None));
+    }
+    let count = syscall::read_dir(&path[..path_length], &mut entries)
         .map_err(|error| report(command, b"read directory failed", Some(error)))?;
     if count > entries.len() {
         return Err(report(command, b"malformed directory count", None));
     }
     for entry in entries.iter().take(count) {
-        if entry.name_length as usize > syscall::NAME_MAX {
+        let name_length = usize::try_from(entry.name_length)
+            .ok()
+            .filter(|length| *length <= syscall::NAME_MAX)
+            .ok_or_else(|| report(command, b"malformed directory entry", None))?;
+        let name = &entry.name[..name_length];
+        if name_length == 0
+            || name.contains(&0)
+            || name.contains(&b'/')
+            || name == b"."
+            || name == b".."
+        {
             return Err(report(command, b"malformed directory entry", None));
         }
-        let mut child = Vec::new();
-        child.extend_from_slice(path);
-        if child.last() != Some(&b'/') {
-            child.push(b'/');
+        if !state.charge_work(name_length.saturating_add(1)) {
+            return Err(report(command, b"work budget exceeded", None));
         }
-        child.extend_from_slice(&entry.name[..entry.name_length as usize]);
-        find_visit(command, &child, name_filter, type_filter, output, depth + 1)?;
+        if depth == FIND_MAX_DEPTH {
+            return Err(report(command, b"directory depth exceeded", None));
+        }
+        let separator = usize::from(path[..path_length].last() != Some(&b'/'));
+        let child_length = path_length
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(name_length))
+            .ok_or_else(|| report(command, b"path is too long", None))?;
+        if child_length > syscall::MAX_PATH {
+            return Err(report(command, b"path is too long", None));
+        }
+        if separator != 0 {
+            path[path_length] = b'/';
+        }
+        let name_start = path_length + separator;
+        path[name_start..child_length].copy_from_slice(name);
+        let result = find_visit(
+            command,
+            path,
+            child_length,
+            name_filter,
+            type_filter,
+            state,
+            depth + 1,
+        );
+        result?;
     }
     Ok(())
 }
@@ -1112,29 +1705,32 @@ fn find(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     if expressions.iter().any(|expression| *expression == b"-name") && name_filter.is_none() {
         return usage(command, b"-name requires a pattern");
     }
-    let mut path = Vec::new();
-    let absolute = match command_path(command, raw, environment, &mut path) {
-        Ok(value) => value.to_vec(),
+    let mut path = [0u8; syscall::MAX_PATH];
+    let path_length = match command_path(command, raw, environment, &mut path) {
+        Ok(path) => path.len(),
         Err(error) => return error,
     };
-    let mut output = Vec::new();
-    match find_visit(command, &absolute, name_filter, type_filter, &mut output, 0) {
-        Ok(()) => match write_all(1, &output) {
-            Ok(()) => 0,
-            Err(error) => report(command, b"write failed", Some(error)),
-        },
+    let mut state = FindState::new();
+    match find_visit(
+        command,
+        &mut path,
+        path_length,
+        name_filter,
+        type_filter,
+        &mut state,
+        0,
+    ) {
+        Ok(()) => 0,
         Err(status) => status,
     }
 }
 
-fn read_sources(
-    command: &[u8],
+fn read_sources_with(
     args: &[&[u8]],
-    environment: &[&[u8]],
+    mut read_source: impl FnMut(&[u8], &mut Vec<u8>) -> Result<(), i32>,
     mut callback: impl FnMut(&[u8], &[u8]) -> Result<(), i32>,
 ) -> i32 {
     let mut input = Vec::new();
-    let mut path = Vec::new();
     let sources = if args.is_empty() { &[][..] } else { args };
     let mut default = b"-".as_slice();
     let sources = if sources.is_empty() {
@@ -1145,36 +1741,41 @@ fn read_sources(
     let mut status = 0;
     for raw in sources {
         input.clear();
-        if *raw == b"-" {
-            if let Err(error) = read_all(0, &mut input) {
-                status = report(command, b"read failed", Some(error));
-                continue;
-            }
-        } else {
-            let absolute = match command_path(command, raw, environment, &mut path) {
-                Ok(value) => value,
-                Err(error) => {
-                    status = error;
-                    continue;
-                }
-            };
-            let fd = match open_read(absolute) {
-                Ok(fd) => fd,
-                Err(error) => {
-                    status = report(command, b"open failed", Some(error));
-                    continue;
-                }
-            };
-            if let Err(error) = read_all(fd, &mut input) {
-                status = report(command, b"read failed", Some(error));
-            }
-            let _ = syscall::close(fd);
+        if let Err(error) = read_source(raw, &mut input) {
+            status = error;
+            continue;
         }
         if callback(raw, &input).is_err() {
             status = 1;
         }
     }
     status
+}
+
+fn read_sources(
+    command: &[u8],
+    args: &[&[u8]],
+    environment: &[&[u8]],
+    callback: impl FnMut(&[u8], &[u8]) -> Result<(), i32>,
+) -> i32 {
+    let mut path = [0u8; syscall::MAX_PATH];
+    read_sources_with(
+        args,
+        |raw, input| {
+            if raw == b"-" {
+                return read_all(0, input)
+                    .map_err(|error| report(command, b"read failed", Some(error)));
+            }
+            let absolute = command_path(command, raw, environment, &mut path)?;
+            let fd = open_read(absolute)
+                .map_err(|error| report(command, b"open failed", Some(error)))?;
+            let result =
+                read_all(fd, input).map_err(|error| report(command, b"read failed", Some(error)));
+            let _ = syscall::close(fd);
+            result
+        },
+        callback,
+    )
 }
 
 fn grep(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
@@ -1210,22 +1811,22 @@ fn grep(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     let mut found = false;
     let status = read_sources(command, files, environment, |name, data| {
         let mut line_number = 0usize;
-        let mut output = Vec::new();
         for line in data.split(|byte| *byte == b'\n') {
             line_number += 1;
             let matched = line.windows(pattern.len()).any(|window| window == *pattern);
             if matched != inverted {
                 found = true;
                 if numbered {
-                    append_u64(&mut output, line_number as u64);
-                    output.push(b':');
+                    write_u64(1, line_number as u64)
+                        .and_then(|_| write_all(1, b":"))
+                        .map_err(|error| report(command, b"write failed", Some(error)))?;
                 }
-                output.extend_from_slice(line);
-                output.push(b'\n');
+                write_line(1, line)
+                    .map_err(|error| report(command, b"write failed", Some(error)))?;
             }
         }
         let _ = name;
-        write_all(1, &output).map_err(|error| report(command, b"write failed", Some(error)))
+        Ok(())
     });
     if status != 0 {
         status
@@ -1258,19 +1859,22 @@ fn line_filter(command: &[u8], args: &[&[u8]], environment: &[&[u8]], take_head:
     }
     let files = &args[index..];
     read_sources(command, files, environment, |_, data| {
-        let lines = data
-            .split_inclusive(|byte| *byte == b'\n')
-            .collect::<Vec<_>>();
-        let selected = if take_head {
-            &lines[..lines.len().min(count)]
+        if take_head {
+            for line in data.split_inclusive(|byte| *byte == b'\n').take(count) {
+                write_all(1, line)
+                    .map_err(|error| report(command, b"write failed", Some(error)))?;
+            }
         } else {
-            &lines[lines.len().saturating_sub(count)..]
-        };
-        let output = selected
-            .iter()
-            .flat_map(|line| line.iter().copied())
-            .collect::<Vec<_>>();
-        write_all(1, &output).map_err(|error| report(command, b"write failed", Some(error)))
+            let all = data.split_inclusive(|byte| *byte == b'\n').count();
+            for line in data
+                .split_inclusive(|byte| *byte == b'\n')
+                .skip(all.saturating_sub(count))
+            {
+                write_all(1, line)
+                    .map_err(|error| report(command, b"write failed", Some(error)))?;
+            }
+        }
+        Ok(())
     })
 }
 
@@ -1282,17 +1886,19 @@ fn sort_command(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
         return usage(command, b"only -- and - are supported options");
     }
     read_sources(command, args, environment, |_, data| {
-        let mut lines = data.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+        let line_count = data.split(|byte| *byte == b'\n').count();
+        let mut lines = Vec::new();
+        try_reserve_exact(&mut lines, line_count)
+            .map_err(|error| report(command, b"out of memory", Some(error)))?;
+        lines.extend(data.split(|byte| *byte == b'\n'));
         if lines.last() == Some(&&[][..]) {
             let _ = lines.pop();
         }
         lines.sort_unstable_by(|left, right| left.cmp(right));
-        let mut output = Vec::new();
         for line in lines {
-            output.extend_from_slice(line);
-            output.push(b'\n');
+            write_line(1, line).map_err(|error| report(command, b"write failed", Some(error)))?;
         }
-        write_all(1, &output).map_err(|error| report(command, b"write failed", Some(error)))
+        Ok(())
     })
 }
 
@@ -1333,24 +1939,25 @@ fn wc(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
     }
     let files = &args[index..];
     read_sources(command, files, environment, |name, data| {
-        let mut output = Vec::new();
         if lines {
-            append_u64(&mut output, line_count(data) as u64);
-            output.push(b' ');
+            write_u64(1, line_count(data) as u64)
+                .and_then(|_| write_all(1, b" "))
+                .map_err(|error| report(command, b"write failed", Some(error)))?;
         }
         if words {
-            append_u64(&mut output, word_count(data) as u64);
-            output.push(b' ');
+            write_u64(1, word_count(data) as u64)
+                .and_then(|_| write_all(1, b" "))
+                .map_err(|error| report(command, b"write failed", Some(error)))?;
         }
         if bytes {
-            append_u64(&mut output, data.len() as u64);
-            output.push(b' ');
+            write_u64(1, data.len() as u64)
+                .and_then(|_| write_all(1, b" "))
+                .map_err(|error| report(command, b"write failed", Some(error)))?;
         }
         if !name.is_empty() && name != b"-" {
-            output.extend_from_slice(name);
+            write_all(1, name).map_err(|error| report(command, b"write failed", Some(error)))?;
         }
-        output.push(b'\n');
-        write_all(1, &output).map_err(|error| report(command, b"write failed", Some(error)))
+        write_all(1, b"\n").map_err(|error| report(command, b"write failed", Some(error)))
     })
 }
 
@@ -1371,6 +1978,7 @@ fn sleep_command(command: &[u8], args: &[&[u8]]) -> i32 {
 }
 
 pub fn run(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
+    let _command_budget = CommandBudget::enter();
     if !is_supported_command(command) {
         return report(command, b"command is not implemented", None) + 126;
     }
@@ -1389,14 +1997,14 @@ pub fn run(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
             if args.len() != 2 {
                 usage(command, b"exactly source and destination are required")
             } else {
-                let mut old = Vec::new();
-                let mut new = Vec::new();
-                let old = match command_path(command, args[0], environment, &mut old) {
-                    Ok(value) => value.to_vec(),
+                let mut old_path = [0u8; syscall::MAX_PATH];
+                let mut new_path = [0u8; syscall::MAX_PATH];
+                let old = match command_path(command, args[0], environment, &mut old_path) {
+                    Ok(value) => value,
                     Err(error) => return error,
                 };
-                let new = match command_path(command, args[1], environment, &mut new) {
-                    Ok(value) => value.to_vec(),
+                let new = match command_path(command, args[1], environment, &mut new_path) {
+                    Ok(value) => value,
                     Err(error) => return error,
                 };
                 syscall::rename(&old, &new).map_or_else(
@@ -1414,11 +2022,11 @@ pub fn run(command: &[u8], args: &[&[u8]], environment: &[&[u8]]) -> i32 {
             if files.is_empty() {
                 usage(command, b"operand required")
             } else {
-                let mut path = Vec::new();
+                let mut path = [0u8; syscall::MAX_PATH];
                 let mut status = 0;
                 for raw in files {
                     let absolute = match command_path(command, raw, environment, &mut path) {
-                        Ok(value) => value.to_vec(),
+                        Ok(value) => value,
                         Err(error) => {
                             status = error;
                             continue;
@@ -1481,6 +2089,7 @@ fn is_supported_command(command: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn parses_bounded_decimal_values() {
@@ -1500,7 +2109,7 @@ mod tests {
 
     #[test]
     fn relative_paths_use_pwd() {
-        let mut output = Vec::new();
+        let mut output = [0u8; syscall::MAX_PATH];
         assert_eq!(
             absolute_path(b"file", &[b"PWD=/tmp"], &mut output),
             Ok(&b"/tmp/file"[..])
@@ -1513,7 +2122,7 @@ mod tests {
 
     #[test]
     fn malformed_paths_and_bounded_globs_are_rejected_deterministically() {
-        let mut output = Vec::new();
+        let mut output = [0u8; syscall::MAX_PATH];
         assert!(absolute_path(b"", &[b"PWD=/tmp"], &mut output).is_err());
         assert!(absolute_path(b"bad\0path", &[b"PWD=/tmp"], &mut output).is_err());
         assert!(absolute_path(b"file", &[b"PWD=relative"], &mut output).is_err());
@@ -1527,10 +2136,87 @@ mod tests {
     }
 
     #[test]
+    fn find_budgets_and_directory_identity_are_bounded() {
+        let mut state = FindState::new();
+        assert!(state.visit_node());
+        assert_eq!(state.visit_directory(7), Some(true));
+        assert_eq!(state.visit_directory(7), Some(false));
+        assert_eq!(state.visit_directory(8), Some(true));
+
+        let mut nodes = FindState::new();
+        for _ in 0..FIND_MAX_NODES {
+            assert!(nodes.visit_node());
+        }
+        assert!(!nodes.visit_node());
+
+        let mut output = FindState::new();
+        assert!(output.reserve_output(FIND_MAX_OUTPUT_BYTES - 1));
+        assert!(!output.reserve_output(2));
+
+        let mut work = FindState::new();
+        assert!(work.charge_work(FIND_MAX_WORK));
+        assert!(!work.charge_work(1));
+    }
+
+    #[test]
     fn bytewise_sort_is_deterministic() {
         let mut values = [b"z".as_slice(), b"a".as_slice(), b"m".as_slice()];
         values.sort_unstable_by(|left, right| left.cmp(right));
         assert_eq!(values, [b"a".as_slice(), b"m".as_slice(), b"z".as_slice()]);
+    }
+
+    #[test]
+    fn short_reads_are_accumulated_before_callback() {
+        let sources = [b"fixture".as_slice()];
+        let chunks = [b"ab".as_slice(), b"c".as_slice(), b"".as_slice()];
+        let mut next_chunk = 0;
+        let mut callback_data = Vec::new();
+        let status = read_sources_with(
+            &sources,
+            |_, input| {
+                read_all_with(input, |buffer| {
+                    let chunk = chunks[next_chunk];
+                    next_chunk += 1;
+                    buffer[..chunk.len()].copy_from_slice(chunk);
+                    Ok(chunk.len())
+                })
+                .map_err(|_| 1)
+            },
+            |_, data| {
+                callback_data.extend_from_slice(data);
+                Ok(())
+            },
+        );
+        assert_eq!(status, 0);
+        assert_eq!(callback_data, b"abc");
+    }
+
+    #[test]
+    fn partial_read_error_skips_callback() {
+        let sources = [b"fixture".as_slice()];
+        let mut reads = 0;
+        let mut callback_called = false;
+        let status = read_sources_with(
+            &sources,
+            |_, input| {
+                read_all_with(input, |buffer| {
+                    if reads == 0 {
+                        reads += 1;
+                        buffer[..7].copy_from_slice(b"partial");
+                        Ok(7)
+                    } else {
+                        Err(syscall::Error(0u64.wrapping_sub(5)))
+                    }
+                })
+                .map_err(|_| 1)
+            },
+            |_, _| {
+                callback_called = true;
+                Ok(())
+            },
+        );
+        assert_eq!(status, 1);
+        assert!(!callback_called);
     }
 
     #[test]
@@ -1540,17 +2226,106 @@ mod tests {
         assert_eq!(syscall::ABI_VERSION, 2);
         assert_eq!(syscall::MAX_PATH, 256);
         assert_eq!(syscall::MAX_DIR_ENTRIES, 16);
+        assert_eq!(syscall::Number::Fstat as syscall::Word, 430);
+        assert_eq!(syscall::OPEN_EXCLUSIVE, 1 << 5);
+    }
+
+    #[test]
+    fn cp_temporary_names_stay_in_the_destination_directory() {
+        let mut output = [0u8; syscall::MAX_PATH];
+        let length = temporary_path(b"/destination", 0, &mut output).unwrap();
+        assert_eq!(&output[..length], b"/.norx-cp-0");
+        let length = temporary_path(b"/tmp/destination", 15, &mut output).unwrap();
+        assert_eq!(&output[..length], b"/tmp/.norx-cp-f");
+        assert!(temporary_path(b"/destination", MAX_TEMP_ATTEMPTS, &mut output).is_none());
+    }
+
+    #[test]
+    fn cp_temporary_name_rejects_path_overflow_before_building_it() {
+        let mut destination = [0u8; syscall::MAX_PATH];
+        destination[0] = b'/';
+        destination[247] = b'/';
+        destination[248..251].copy_from_slice(b"dst");
+        let mut output = [0u8; syscall::MAX_PATH];
+        assert!(temporary_path(&destination[..251], 0, &mut output).is_none());
     }
 
     #[test]
     fn dispatch_contract_contains_exactly_twenty_two_commands() {
         let commands: &[&[u8]] = &[
-            b"cat", b"echo", b"env", b"ls", b"pwd", b"mkdir", b"rmdir", b"cp", b"mv",
-            b"rm", b"touch", b"ln", b"stat", b"find", b"grep", b"head", b"tail", b"sort",
-            b"wc", b"true", b"false", b"sleep",
+            b"cat", b"echo", b"env", b"ls", b"pwd", b"mkdir", b"rmdir", b"cp", b"mv", b"rm",
+            b"touch", b"ln", b"stat", b"find", b"grep", b"head", b"tail", b"sort", b"wc", b"true",
+            b"false", b"sleep",
         ];
         assert_eq!(commands.len(), 22);
         assert!(commands.iter().all(|command| is_supported_command(command)));
         assert!(!is_supported_command(b"sh"));
+    }
+
+    #[test]
+    fn allocator_claims_disjoint_ranges_under_contention() {
+        const THREADS: usize = 8;
+        const ALLOCATIONS: usize = 64;
+        const ALLOCATION_SIZE: usize = 16;
+        const SLOTS: usize = THREADS * ALLOCATIONS;
+        static TEST_HEAP: Heap = Heap::new();
+
+        let start = AtomicBool::new(false);
+        let ready = AtomicUsize::new(0);
+        let pointers = core::array::from_fn::<_, SLOTS, _>(|_| AtomicUsize::new(0));
+        let start_ref = &start;
+        let ready_ref = &ready;
+        let pointers_ref = &pointers;
+
+        std::thread::scope(|scope| {
+            for thread_id in 0..THREADS {
+                scope.spawn(move || {
+                    ready_ref.fetch_add(1, Ordering::Relaxed);
+                    while !start_ref.load(Ordering::Acquire) {
+                        core::hint::spin_loop();
+                    }
+                    let layout = Layout::from_size_align(ALLOCATION_SIZE, 8).unwrap();
+                    for allocation in 0..ALLOCATIONS {
+                        let pointer = unsafe { TEST_HEAP.alloc(layout) };
+                        if !pointer.is_null() {
+                            pointers_ref[thread_id * ALLOCATIONS + allocation]
+                                .store(pointer as usize, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            while ready.load(Ordering::Acquire) != THREADS {
+                core::hint::spin_loop();
+            }
+            start.store(true, Ordering::Release);
+        });
+
+        let mut addresses = [0usize; SLOTS];
+        let mut count = 0;
+        for pointer in pointers.iter() {
+            let pointer = pointer.load(Ordering::Relaxed);
+            if pointer != 0 {
+                addresses[count] = pointer;
+                count += 1;
+            }
+        }
+        assert!(count >= THREADS);
+        addresses[..count].sort_unstable();
+        assert!(addresses[..count].windows(2).all(|pair| pair[0] != pair[1]));
+        let cursor = TEST_HEAP.cursor.load(Ordering::Acquire);
+        assert!(cursor >= count * ALLOCATION_SIZE);
+        assert!(cursor <= HEAP_BYTES);
+    }
+
+    #[test]
+    fn allocator_rejects_exhaustion_and_oversized_layouts() {
+        static TEST_HEAP: Heap = Heap::new();
+        let full = Layout::from_size_align(HEAP_BYTES, 1).unwrap();
+        assert!(!unsafe { TEST_HEAP.alloc(full) }.is_null());
+        assert!(unsafe { TEST_HEAP.alloc(Layout::from_size_align(1, 1).unwrap()) }.is_null());
+        assert!(unsafe {
+            TEST_HEAP.alloc(Layout::from_size_align(isize::MAX as usize, 1).unwrap())
+        }
+        .is_null());
     }
 }
