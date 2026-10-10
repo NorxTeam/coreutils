@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and stage the Norx coreutils multicall ELF for both targets."""
+"""Build and stage the Norx coreutils multicall ELF for the native ARM64 target."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def main() -> int:
     build_root = COREUTILS_ROOT / "build"
     rootfs = Path(os.environ.get("NORX_ROOTFS", REPO_ROOT / "test-rootfs"))
     results: dict[str, str] = {}
-    for target_name, target_info in (("x86_64", abi["targets"]["x86_64"]), ("aarch64", abi["targets"]["aarch64"])):
+    for target_name, target_info in (("aarch64", abi["targets"]["aarch64"]),):
         target_dir = build_root / target_name
         target_dir.mkdir(parents=True, exist_ok=True)
         linker_script = REPO_ROOT / "toolchain" / target_info["linker_script"]

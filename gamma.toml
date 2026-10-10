@@ -20,7 +20,7 @@ maintained_fork = "https://github.com/NorxTeam/coreutils.git"
 [build]
 script = "norx/scripts/build.py"
 network = false
-targets = ["x86_64", "aarch64"]
+targets = ["aarch64"]
 build_std = ["core", "alloc"]
 
 [dependencies]
